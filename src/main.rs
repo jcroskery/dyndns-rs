@@ -23,7 +23,7 @@ async fn get(uri: &str) -> Request<Body> {
 
 async fn build_cloudflare_request(
     put: bool,
-    creds: &Value,
+    creds: &Creds,
     uri: String,
     body: String,
 ) -> Request<Body> {
@@ -31,8 +31,8 @@ async fn build_cloudflare_request(
         .method(if put { Method::PUT } else { Method::GET })
         .uri(uri)
         .header("content-type", "application/json")
-        .header("X-Auth-Email", creds["email"].as_str().unwrap())
-        .header("X-Auth-Key", creds["key"].as_str().unwrap())
+        .header("X-Auth-Email", creds.email.clone())
+        .header("X-Auth-Key", creds.key.clone())
         .body(Body::from(body))
         .unwrap()
 }
@@ -44,13 +44,13 @@ async fn get_zone<T: Future<Output = String>>(request: T) -> String {
 
 async fn get_domain_ids<T: Future<Output = String>>(
     request: T,
-    creds: &Value,
+    creds: &Creds,
 ) -> Vec<(String, String, String)> {
     let json: Value = serde_json::from_str(&request.await).unwrap();
     let mut ids = vec![];
     for domain in json["result"].as_array().unwrap() {
-        for requested_domain in creds["domains"].as_array().unwrap() {
-            if domain["type"] == json!("A") && &domain["name"] == requested_domain {
+        for requested_domain in creds.domains.clone() {
+            if domain["type"] == json!("A") && domain["name"] == json!(requested_domain) {
                 ids.push((
                     from_value(domain["content"].clone()).unwrap(),
                     from_value(domain["name"].clone()).unwrap(),
@@ -94,7 +94,7 @@ async fn make_req<T: Future<Output = Request<Body>>>(
     .unwrap()
 }
 
-async fn get_creds() -> Value {
+async fn get_creds() -> Creds {
     serde_json::from_str(&fs::read_to_string("/etc/dyndns/creds.json").await.unwrap()).unwrap()
 }
 
