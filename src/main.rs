@@ -3,14 +3,27 @@ use futures::future::join_all;
 use futures::join;
 use hyper::{client::HttpConnector, Body, Client, Method, Request};
 use hyper_tls::HttpsConnector;
+use serde::{Deserialize, Serialize};
 use serde_json::{from_value, json, Value};
 use std::future::Future;
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 struct Creds {
     email: String,
     key: String,
     domains: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Cache {
+    domains: Vec<Domain>,
+    zone: String,
+}
+#[derive(Deserialize, Serialize, Clone)]
+struct Domain {
+    name: String,
+    ip: String,
+    id: String,
 }
 
 async fn get(uri: &str) -> Request<Body> {
@@ -42,41 +55,35 @@ async fn get_zone<T: Future<Output = String>>(request: T) -> String {
     from_value(json["result"][0]["id"].clone()).unwrap()
 }
 
-async fn get_domain_ids<T: Future<Output = String>>(
-    request: T,
-    creds: &Creds,
-) -> Vec<(String, String, String)> {
+async fn get_domain_ids<T: Future<Output = String>>(request: T, creds: &Creds) -> Vec<Domain> {
     let json: Value = serde_json::from_str(&request.await).unwrap();
     let mut ids = vec![];
     for domain in json["result"].as_array().unwrap() {
         for requested_domain in creds.domains.clone() {
             if domain["type"] == json!("A") && domain["name"] == json!(requested_domain) {
-                ids.push((
-                    from_value(domain["content"].clone()).unwrap(),
-                    from_value(domain["name"].clone()).unwrap(),
-                    from_value(domain["id"].clone()).unwrap(),
-                ));
+                ids.push(Domain {
+                    ip: from_value(domain["content"].clone()).unwrap(),
+                    name: from_value(domain["name"].clone()).unwrap(),
+                    id: from_value(domain["id"].clone()).unwrap(),
+                });
             }
         }
     }
     ids
 }
 
-async fn get_new_domain_ids<T: Future<Output = String>>(
-    request: T,
-    domain: String,
-) -> (String, String, String) {
+async fn get_new_domain_ids<T: Future<Output = String>>(request: T, domain: String) -> Domain {
     let json: Value = serde_json::from_str(&request.await).unwrap();
     if from_value(json["success"].clone()).unwrap() {
         println!("Successfully updated the ip for {}.", domain);
     } else {
         println!("Failed to update the ip for {}.", domain)
     }
-    (
-        from_value(json["result"]["content"].clone()).unwrap(),
-        domain,
-        from_value(json["result"]["id"].clone()).unwrap(),
-    )
+    Domain {
+        ip: from_value(json["result"]["content"].clone()).unwrap(),
+        name: domain,
+        id: from_value(json["result"]["id"].clone()).unwrap(),
+    }
 }
 
 async fn make_req<T: Future<Output = Request<Body>>>(
@@ -98,7 +105,7 @@ async fn get_creds() -> Creds {
     serde_json::from_str(&fs::read_to_string("/etc/dyndns/creds.json").await.unwrap()).unwrap()
 }
 
-async fn get_cache() -> Option<Value> {
+async fn get_cache() -> Option<Cache> {
     if let Ok(file) = fs::read_to_string("/var/lib/dyndns/dyndns.json").await {
         serde_json::from_str(&file).ok()
     } else {
@@ -106,18 +113,11 @@ async fn get_cache() -> Option<Value> {
     }
 }
 
-async fn create_cache(zone: String, domain_ids: Vec<(String, String, String)>) {
-    fs::write(
-        "/var/lib/dyndns/dyndns.json",
-        json!({"zone": zone, "domains": domain_ids}).to_string(),
-    )
-    .await
-    .ok();
-}
-
-fn parse_cache(cache: Value) -> (String, Vec<(String, String, String)>) {
-    let cool = from_value(cache["domains"].clone()).unwrap();
-    (from_value(cache["zone"].clone()).unwrap(), cool)
+async fn create_cache(zone: String, domains: Vec<Domain>) {
+    let cache = Cache { zone, domains };
+    fs::write("/var/lib/dyndns/dyndns.json", json!(cache).to_string())
+        .await
+        .ok();
 }
 
 #[tokio::main]
@@ -130,12 +130,11 @@ async fn main() {
     let ip_request = get("https://ipecho.net/plain");
     let ip_response = make_req(ip_request, client);
     let (url, ip, domain_ids, zone) = if let Some(cache) = get_cache().await {
-        let (zone, domain_ids) = parse_cache(cache);
         (
-            format!("{}{}/dns_records", url, zone),
+            format!("{}{}/dns_records", url, cache.zone),
             ip_response.await,
-            domain_ids,
-            zone,
+            cache.domains,
+            cache.zone,
         )
     } else {
         let zones_request = build_cloudflare_request(false, &creds, url.clone(), "".to_string());
@@ -148,17 +147,20 @@ async fn main() {
         (url, ip, domain_ids, zone)
     };
     let mut futures = vec![];
-    for (cloudflare_ip, domain, id) in domain_ids.clone() {
-        if cloudflare_ip != ip {
+    for domain in domain_ids.clone() {
+        if domain.ip != ip {
             gen_cache = true;
-            let url = format!("{}/{}", url, id.clone());
+            let url = format!("{}/{}", url, domain.id.clone());
             let body =
-                json!({"type": "A", "name": domain.clone(), "content": ip, "ttl": 1, "proxied": false})
+                json!({"type": "A", "name": domain.name.clone(), "content": ip, "ttl": 1, "proxied": false})
                     .to_string();
             let change_request = build_cloudflare_request(true, &creds, url, body);
-            futures.push(get_new_domain_ids(make_req(change_request, client), domain));
+            futures.push(get_new_domain_ids(
+                make_req(change_request, client),
+                domain.name,
+            ));
         } else {
-            println!("{} is up to date.", domain);
+            println!("{} is up to date.", domain.name);
         }
     }
     if futures.len() != 0 {
