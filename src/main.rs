@@ -1,10 +1,14 @@
-use async_std::fs;
 use futures::future::join_all;
 use futures::join;
-use hyper::{client::HttpConnector, Body, Client, Method, Request};
-use hyper_tls::HttpsConnector;
+use http::Request;
+use hyper::{Body, Method, Client};
+use hyper::body::to_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, from_value, json, Value};
+use hyper_alpn::AlpnConnector;
+
+use async_std::fs;
+
 use std::future::Future;
 
 #[derive(Deserialize)]
@@ -94,10 +98,10 @@ async fn get_new_domain_ids<T: Future<Output = Option<String>>>(
 
 async fn make_req<T: Future<Output = Option<Request<Body>>>>(
     request: T,
-    client: &Client<HttpsConnector<HttpConnector>>,
+    client: &Client<AlpnConnector>,
 ) -> Option<String> {
     let resp = client.request(request.await?).await.ok()?;
-    String::from_utf8(hyper::body::to_bytes(resp.into_body()).await.ok()?.to_vec()).ok()
+    String::from_utf8(to_bytes(resp.into_body()).await.ok()?.to_vec()).ok()
 }
 
 async fn get_creds() -> Option<Creds> {
@@ -125,11 +129,7 @@ async fn delete_cache() {
 
 async fn dyndns() -> Option<()> {
     let mut gen_cache = false;
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
-    let native_tls = native_tls::TlsConnector::new().ok()?;
-    let https: HttpsConnector<HttpConnector> = From::from((http, From::from(native_tls)));
-    let client = &Client::builder().build(https);
+    let client = &Client::builder().http2_only(true).build(AlpnConnector::new());
     let creds = get_creds().await?;
     let url = "https://api.cloudflare.com/client/v4/zones/".to_string();
     let ip_request = get("https://ipecho.net/plain");
