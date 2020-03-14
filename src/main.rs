@@ -4,7 +4,7 @@ use futures::join;
 use hyper::{client::HttpConnector, Body, Client, Method, Request};
 use hyper_tls::HttpsConnector;
 use serde::{Deserialize, Serialize};
-use serde_json::{from_value, json, Value};
+use serde_json::{from_str, from_value, json, Value};
 use std::future::Future;
 
 #[derive(Deserialize)]
@@ -26,12 +26,12 @@ struct Domain {
     id: String,
 }
 
-async fn get(uri: &str) -> Request<Body> {
+async fn get(uri: &str) -> Option<Request<Body>> {
     Request::builder()
         .method(Method::GET)
         .uri(uri)
         .body(Body::from(""))
-        .unwrap()
+        .ok()
 }
 
 async fn build_cloudflare_request(
@@ -39,7 +39,7 @@ async fn build_cloudflare_request(
     creds: &Creds,
     uri: String,
     body: String,
-) -> Request<Body> {
+) -> Option<Request<Body>> {
     Request::builder()
         .method(if put { Method::PUT } else { Method::GET })
         .uri(uri)
@@ -47,67 +47,66 @@ async fn build_cloudflare_request(
         .header("X-Auth-Email", creds.email.clone())
         .header("X-Auth-Key", creds.key.clone())
         .body(Body::from(body))
-        .unwrap()
+        .ok()
 }
 
-async fn get_zone<T: Future<Output = String>>(request: T) -> String {
-    let json: Value = serde_json::from_str(&request.await).unwrap();
-    from_value(json["result"][0]["id"].clone()).unwrap()
+async fn get_zone<T: Future<Output = Option<String>>>(request: T) -> Option<String> {
+    let json: Value = from_str(&request.await?).ok()?;
+    from_value(json["result"][0]["id"].clone()).ok()
 }
 
-async fn get_domain_ids<T: Future<Output = String>>(request: T, creds: &Creds) -> Vec<Domain> {
-    let json: Value = serde_json::from_str(&request.await).unwrap();
+async fn get_domain_ids<T: Future<Output = Option<String>>>(
+    request: T,
+    creds: &Creds,
+) -> Option<Vec<Domain>> {
+    let json: Value = from_str(&request.await?).ok()?;
     let mut ids = vec![];
-    for domain in json["result"].as_array().unwrap() {
+    for domain in json["result"].as_array()? {
         for requested_domain in creds.domains.clone() {
             if domain["type"] == json!("A") && domain["name"] == json!(requested_domain) {
                 ids.push(Domain {
-                    ip: from_value(domain["content"].clone()).unwrap(),
-                    name: from_value(domain["name"].clone()).unwrap(),
-                    id: from_value(domain["id"].clone()).unwrap(),
+                    ip: from_value(domain["content"].clone()).ok()?,
+                    name: from_value(domain["name"].clone()).ok()?,
+                    id: from_value(domain["id"].clone()).ok()?,
                 });
             }
         }
     }
-    ids
+    Some(ids)
 }
 
-async fn get_new_domain_ids<T: Future<Output = String>>(request: T, domain: String) -> Domain {
-    let json: Value = serde_json::from_str(&request.await).unwrap();
-    if from_value(json["success"].clone()).unwrap() {
+async fn get_new_domain_ids<T: Future<Output = Option<String>>>(
+    request: T,
+    domain: String,
+) -> Option<Domain> {
+    let json: Value = from_str(&request.await?).ok()?;
+    if from_value(json["success"].clone()).ok()? {
         println!("Successfully updated the ip for {}.", domain);
     } else {
         println!("Failed to update the ip for {}.", domain)
     }
-    Domain {
-        ip: from_value(json["result"]["content"].clone()).unwrap(),
+    Some(Domain {
+        ip: from_value(json["result"]["content"].clone()).ok()?,
         name: domain,
-        id: from_value(json["result"]["id"].clone()).unwrap(),
-    }
+        id: from_value(json["result"]["id"].clone()).ok()?,
+    })
 }
 
-async fn make_req<T: Future<Output = Request<Body>>>(
+async fn make_req<T: Future<Output = Option<Request<Body>>>>(
     request: T,
     client: &Client<HttpsConnector<HttpConnector>>,
-) -> String {
-    let t = request.await;
-    let resp = client.request(t).await.unwrap();
-    String::from_utf8(
-        hyper::body::to_bytes(resp.into_body())
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap()
+) -> Option<String> {
+    let resp = client.request(request.await?).await.ok()?;
+    String::from_utf8(hyper::body::to_bytes(resp.into_body()).await.ok()?.to_vec()).ok()
 }
 
-async fn get_creds() -> Creds {
-    serde_json::from_str(&fs::read_to_string("/etc/dyndns/creds.json").await.unwrap()).unwrap()
+async fn get_creds() -> Option<Creds> {
+    from_str(&fs::read_to_string("/etc/dyndns/creds.json").await.ok()?).ok()
 }
 
 async fn get_cache() -> Option<Cache> {
     if let Ok(file) = fs::read_to_string("/var/lib/dyndns/dyndns.json").await {
-        serde_json::from_str(&file).ok()
+        from_str(&file).ok()
     } else {
         None
     }
@@ -120,19 +119,31 @@ async fn create_cache(zone: String, domains: Vec<Domain>) {
         .ok();
 }
 
-#[tokio::main]
-async fn main() {
+async fn delete_cache() {
+    fs::write("/var/lib/dyndns/dyndns.json", "").await.ok();
+}
+
+async fn dyndns() -> Option<()> {
     let mut gen_cache = false;
-    let https = HttpsConnector::new();
-    let client = &Client::builder().build::<_, Body>(https);
-    let creds = get_creds().await;
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let native_tls = native_tls::TlsConnector::new().ok()?;
+    let https: HttpsConnector<HttpConnector> = From::from((http, From::from(native_tls)));
+    let client = &Client::builder().build(https);
+    let creds = get_creds().await?;
     let url = "https://api.cloudflare.com/client/v4/zones/".to_string();
     let ip_request = get("https://ipecho.net/plain");
     let ip_response = make_req(ip_request, client);
     let (url, ip, domain_ids, zone) = if let Some(cache) = get_cache().await {
+        let domains: Vec<String> = cache.domains.iter().map(|x| x.name.clone()).collect();
+        for domain in creds.domains.clone() {
+            if !domains.contains(&domain) {
+                return None;
+            }
+        }
         (
             format!("{}{}/dns_records", url, cache.zone),
-            ip_response.await,
+            ip_response.await?,
             cache.domains,
             cache.zone,
         )
@@ -140,11 +151,11 @@ async fn main() {
         let zones_request = build_cloudflare_request(false, &creds, url.clone(), "".to_string());
         let zones_response = get_zone(make_req(zones_request, client));
         let (ip, zone) = join!(ip_response, zones_response);
-        let url = format!("{}{}/dns_records", url, zone);
+        let url = format!("{}{}/dns_records", url, zone.clone()?);
         let zones_request = build_cloudflare_request(false, &creds, url.clone(), "".to_string());
         let domain_ids = get_domain_ids(make_req(zones_request, client), &creds).await;
         gen_cache = true;
-        (url, ip, domain_ids, zone)
+        (url, ip?, domain_ids?, zone?)
     };
     let mut futures = vec![];
     for domain in domain_ids.clone() {
@@ -164,8 +175,21 @@ async fn main() {
         }
     }
     if futures.len() != 0 {
-        create_cache(zone, join_all(futures).await).await;
+        let mut domains = vec![];
+        for domain in join_all(futures).await {
+            domains.push(domain?);
+        }
+        create_cache(zone, domains).await;
     } else if gen_cache {
         create_cache(zone, domain_ids).await;
+    }
+    Some(())
+}
+
+#[tokio::main]
+async fn main() {
+    if let None = dyndns().await {
+        delete_cache().await;
+        dyndns().await;
     }
 }
