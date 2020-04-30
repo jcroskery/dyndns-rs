@@ -13,8 +13,9 @@ use std::future::Future;
 
 #[derive(Deserialize)]
 struct Creds {
-    email: String,
-    key: String,
+    cf_uale: String,
+    zone: String,
+    root: String,
     domains: Vec<String>,
 }
 
@@ -43,13 +44,15 @@ async fn build_cloudflare_request(
     creds: &Creds,
     uri: String,
     body: String,
+    vses2: &str,
+    atok: &str,
 ) -> Option<Request<Body>> {
     Request::builder()
         .method(if put { Method::PUT } else { Method::GET })
         .uri(uri)
         .header("content-type", "application/json")
-        .header("X-Auth-Email", creds.email.clone())
-        .header("X-Auth-Key", creds.key.clone())
+        .header("Cookie", format!("vses2={}", vses2))
+        .header("x-atok", atok)
         .body(Body::from(body))
         .ok()
 }
@@ -104,6 +107,25 @@ async fn make_req<T: Future<Output = Option<Request<Body>>>>(
     String::from_utf8(to_bytes(resp.into_body()).await.ok()?.to_vec()).ok()
 }
 
+async fn make_req_for_cookies<T: Future<Output = Option<Request<Body>>>>(
+    request: T,
+    client: &Client<AlpnConnector>,
+) -> Option<(String, String)> {
+    let resp = client.request(request.await?).await.ok()?;
+    let mut vses2 = String::new();
+    for cookie in resp.headers().get_all("set-cookie").iter() {
+        let cookie = cookie.to_str().ok()?;
+        if cookie.contains("vses2") {
+            vses2 = cookie.split("vses2=").collect::<String>().split(";").next().unwrap().to_string();
+        }
+    }
+    let string = String::from_utf8(to_bytes(resp.into_body()).await.ok()?.to_vec()).unwrap();
+    let mut iter = string.split("\"atok\":\"");
+    iter.next();
+    let token = iter.next().unwrap().split("\"").next().unwrap();
+    Some((vses2, token.to_string()))
+}
+
 async fn get_creds() -> Option<Creds> {
     from_str(&fs::read_to_string("/etc/dyndns/creds.json").await.ok()?).ok()
 }
@@ -127,13 +149,27 @@ async fn delete_cache() {
     fs::write("/var/lib/dyndns/dyndns.json", "").await.ok();
 }
 
+async fn vses2_req(cf_uale: &str, zone: &str, root: &str) -> Option<Request<Body>> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://dash.cloudflare.com/{}/{}/dns", zone, root))
+        .header("Cookie", cf_uale)
+        .body(Body::from(""))
+        .ok()
+}
+
+async fn get_vses2(cf_uale: &str, zone: &str, root: &str, client: &Client<AlpnConnector>) -> (String, String) {
+    make_req_for_cookies(vses2_req(cf_uale, zone, root), client).await.unwrap()
+}
+
 async fn dyndns() -> Option<()> {
     let mut gen_cache = false;
     let client = &Client::builder().http2_only(true).build(AlpnConnector::new());
     let creds = get_creds().await?;
-    let url = "https://api.cloudflare.com/client/v4/zones/".to_string();
+    let url = "https://dash.cloudflare.com/api/v4/zones/".to_string();
     let ip_request = get("https://ipecho.net/plain");
     let ip_response = make_req(ip_request, client);
+    let (vses2, atok) = get_vses2(&creds.cf_uale, &creds.zone, &creds.root, client).await;
     let (url, ip, domain_ids, zone) = if let Some(cache) = get_cache().await {
         let domains: Vec<String> = cache.domains.iter().map(|x| x.name.clone()).collect();
         for domain in creds.domains.clone() {
@@ -148,11 +184,11 @@ async fn dyndns() -> Option<()> {
             cache.zone,
         )
     } else {
-        let zones_request = build_cloudflare_request(false, &creds, url.clone(), "".to_string());
+        let zones_request = build_cloudflare_request(false, &creds, url.clone(), "".to_string(), &vses2, &atok);
         let zones_response = get_zone(make_req(zones_request, client));
         let (ip, zone) = join!(ip_response, zones_response);
         let url = format!("{}{}/dns_records", url, zone.clone()?);
-        let zones_request = build_cloudflare_request(false, &creds, url.clone(), "".to_string());
+        let zones_request = build_cloudflare_request(false, &creds, url.clone(), "".to_string(), &vses2, &atok);
         let domain_ids = get_domain_ids(make_req(zones_request, client), &creds).await;
         gen_cache = true;
         (url, ip?, domain_ids?, zone?)
@@ -165,7 +201,7 @@ async fn dyndns() -> Option<()> {
             let body =
                 json!({"type": "A", "name": domain.name.clone(), "content": ip, "ttl": 1, "proxied": false})
                     .to_string();
-            let change_request = build_cloudflare_request(true, &creds, url, body);
+            let change_request = build_cloudflare_request(true, &creds, url, body, &vses2, &atok);
             futures.push(get_new_domain_ids(
                 make_req(change_request, client),
                 domain.name,
